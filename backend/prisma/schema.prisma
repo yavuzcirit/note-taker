@@ -1,0 +1,95 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String         @id @default(uuid())
+  email         String         @unique
+  passwordHash  String
+  name          String
+  avatarUrl     String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+  documents     Document[]
+  versions      Version[]
+  shareLinks    ShareLink[]
+  refreshTokens RefreshToken[]
+
+  @@map("users")
+}
+
+model Document {
+  id        String    @id @default(uuid())
+  title     String    @default("Untitled")
+  yjsState  Bytes?
+  content   Json?
+  icon      String?
+  isDeleted Boolean   @default(false)
+  deletedAt DateTime?
+  position  Int       @default(0)
+  ownerId   String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  owner      User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  versions   Version[]
+  shareLinks ShareLink[]
+
+  @@index([ownerId, isDeleted])
+  @@map("documents")
+}
+
+model Version {
+  id           String   @id @default(uuid())
+  documentId   String
+  yjsSnapshot  Bytes
+  contentJson  Json?
+  title        String
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  document  Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  createdBy User     @relation(fields: [createdById], references: [id])
+
+  @@index([documentId, createdAt(sort: Desc)])
+  @@map("versions")
+}
+
+model ShareLink {
+  id          String     @id @default(uuid())
+  documentId  String
+  createdById String
+  token       String     @unique @default(uuid())
+  permission  Permission @default(READ)
+  expiresAt   DateTime?
+  createdAt   DateTime   @default(now())
+
+  document  Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  createdBy User     @relation(fields: [createdById], references: [id])
+
+  @@index([token])
+  @@map("share_links")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  tokenHash String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+enum Permission {
+  READ
+  EDIT
+}
