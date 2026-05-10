@@ -1,22 +1,21 @@
 'use client'
 
-import { useEffect, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import { useEditor, EditorContent } from '@tiptap/react'
+import { Extension } from '@tiptap/core'
 import StarterKit from '@tiptap/starter-kit'
 import Collaboration from '@tiptap/extension-collaboration'
-import CollaborationCursor from '@tiptap/extension-collaboration-cursor'
 import Placeholder from '@tiptap/extension-placeholder'
 import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight'
 import { common, createLowlight } from 'lowlight'
-import { Awareness } from 'y-protocols/awareness'
-import { encodeAwarenessUpdate, applyAwarenessUpdate } from 'y-protocols/awareness'
+import { yCursorPlugin } from '@tiptap/y-tiptap'
+import type { Awareness } from 'y-protocols/awareness'
 import { SlashCommand } from './extensions/SlashCommand'
 import { EditorToolbar } from './EditorToolbar'
 import { useCollaboration } from '@/hooks/useCollaboration'
 import { useSocket } from '@/hooks/useSocket'
 import { useUpdateDocument } from '@/hooks/useDocuments'
 import { debounce } from '@/lib/debounce'
-import { Spinner } from '@/components/atoms/Spinner'
 import { User } from '@/types'
 
 const lowlight = createLowlight(common)
@@ -39,7 +38,7 @@ interface EditorProps {
 
 export function Editor({ documentId, user, initialContent }: EditorProps) {
   const socket = useSocket()
-  const { ydoc, synced } = useCollaboration(documentId)
+  const { ydoc } = useCollaboration(documentId)
   const { mutate: updateDoc } = useUpdateDocument()
   const awarenessRef = useRef<Awareness | null>(null)
 
@@ -49,73 +48,77 @@ export function Editor({ documentId, user, initialContent }: EditorProps) {
     }, 1500),
   ).current
 
+  // Create awareness once (render-phase, before useEditor's first effect fires).
+  if (!awarenessRef.current) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Awareness: AwarenessClass } = require('y-protocols/awareness') as typeof import('y-protocols/awareness')
+    const awareness: Awareness = new AwarenessClass(ydoc)
+    awareness.setLocalStateField('user', { name: user.name, color: stringToColor(user.id) })
+    awarenessRef.current = awareness
+  }
+
+  // Wire awareness ↔ socket with proper cleanup.
+  useEffect(() => {
+    const awareness = awarenessRef.current!
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { encodeAwarenessUpdate, applyAwarenessUpdate } = require('y-protocols/awareness') as typeof import('y-protocols/awareness')
+
+    const handleAwarenessChange = ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
+      const changed = [...added, ...updated, ...removed]
+      if (!changed.length) return
+      const update = encodeAwarenessUpdate(awareness, changed)
+      socket.emit('awareness:update', { documentId, awarenessUpdate: update.buffer as ArrayBuffer })
+    }
+
+    const handleSocketAwareness = ({ documentId: id, awarenessUpdate }: { documentId: string; awarenessUpdate: ArrayBuffer }) => {
+      if (id !== documentId) return
+      applyAwarenessUpdate(awareness, new Uint8Array(awarenessUpdate), 'remote')
+    }
+
+    awareness.on('update', handleAwarenessChange)
+    socket.on('awareness:update', handleSocketAwareness)
+    return () => {
+      awareness.off('update', handleAwarenessChange)
+      socket.off('awareness:update', handleSocketAwareness)
+    }
+  }, [documentId, socket])
+
+  // Memoize extensions so the array reference is stable across renders.
+  // Without this, Tiptap v3 calls editor.setOptions() on every render (because
+  // compareOptions sees new object references), which tears down and recreates
+  // the ySyncPlugin binding on every render — breaking live sync entirely.
+  const extensions = useMemo(() => [
+    StarterKit.configure({ undoRedo: false }),
+    Placeholder.configure({
+      placeholder: ({ node }) =>
+        node.type.name === 'heading' ? 'Heading' : "Type '/' for commands…",
+    }),
+    CodeBlockLowlight.configure({ lowlight }),
+    SlashCommand,
+    Collaboration.configure({ document: ydoc }),
+    Extension.create({
+      name: 'collaborationCursor',
+      addProseMirrorPlugins: () => [yCursorPlugin(awarenessRef.current!)],
+    }),
+  // ydoc is stable (from useState in useCollaboration), so this runs once.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [ydoc])
+
   const editor = useEditor(
     {
-      extensions: [
-        StarterKit.configure({ undoRedo: false }),
-        Placeholder.configure({
-          placeholder: ({ node }) =>
-            node.type.name === 'heading' ? 'Heading' : "Type '/' for commands…",
-        }),
-        CodeBlockLowlight.configure({ lowlight }),
-        SlashCommand,
-        ...(ydoc
-          ? [
-              Collaboration.configure({ document: ydoc }),
-              CollaborationCursor.configure({
-                provider: {
-                  awareness: (() => {
-                    if (!awarenessRef.current && ydoc) {
-                      const awareness = new Awareness(ydoc)
-                      awareness.setLocalStateField('user', {
-                        name: user.name,
-                        color: stringToColor(user.id),
-                      })
-
-                      awareness.on(
-                        'update',
-                        ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }) => {
-                          const changed = [...added, ...updated, ...removed]
-                          if (!changed.length) return
-                          const update = encodeAwarenessUpdate(awareness, changed)
-                          socket.emit('awareness:update', {
-                            documentId,
-                            awarenessUpdate: update.buffer as ArrayBuffer,
-                          })
-                        },
-                      )
-
-                      socket.on('awareness:update', ({ documentId: id, awarenessUpdate }) => {
-                        if (id !== documentId) return
-                        applyAwarenessUpdate(
-                          awareness,
-                          new Uint8Array(awarenessUpdate as ArrayBuffer),
-                          'remote',
-                        )
-                      })
-
-                      awarenessRef.current = awareness
-                    }
-                    return awarenessRef.current!
-                  })(),
-                },
-                user: { name: user.name, color: stringToColor(user.id) },
-              }),
-            ]
-          : []),
-      ],
+      extensions,
       editorProps: {
         attributes: {
           class:
             'prose prose-gray dark:prose-invert max-w-none focus:outline-none min-h-[calc(100vh-200px)] px-8 py-6',
         },
       },
-      content: !ydoc && initialContent ? initialContent : undefined,
+      immediatelyRender: false,
       onUpdate: ({ editor }) => {
         debouncedSave(editor.getJSON())
       },
     },
-    [ydoc],
+    [],
   )
 
   useEffect(() => {
@@ -124,17 +127,6 @@ export function Editor({ documentId, user, initialContent }: EditorProps) {
       awarenessRef.current = null
     }
   }, [])
-
-  if (!synced && !editor) {
-    return (
-      <div className="flex h-64 items-center justify-center">
-        <div className="flex flex-col items-center gap-3 text-gray-400">
-          <Spinner className="h-6 w-6" />
-          <span className="text-sm">Connecting…</span>
-        </div>
-      </div>
-    )
-  }
 
   return (
     <div className="flex flex-col">

@@ -1,67 +1,69 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import * as Y from 'yjs'
-import { IndexeddbPersistence } from 'y-indexeddb'
 import { useSocket } from './useSocket'
 
 interface CollaborationState {
-  ydoc: Y.Doc | null
+  ydoc: Y.Doc
   synced: boolean
 }
 
 export function useCollaboration(documentId: string): CollaborationState {
   const socket = useSocket()
   const [synced, setSynced] = useState(false)
-  const ydocRef = useRef<Y.Doc | null>(null)
-  const persistenceRef = useRef<IndexeddbPersistence | null>(null)
-  const [, forceRender] = useState(0)
+
+  // useState guarantees the same Y.Doc instance across ALL renders of this component,
+  // including React Strict Mode's simulated cleanup/remount. useRef would be reset to
+  // null by the cleanup, causing the socket handlers (second-pass) to use a DIFFERENT
+  // doc than the one the editor's ySyncPlugin is observing — breaking live sync.
+  const [ydoc] = useState(() => new Y.Doc())
 
   useEffect(() => {
-    const ydoc = new Y.Doc()
-    ydocRef.current = ydoc
-    forceRender((n) => n + 1)
+    let joined = false
 
-    const persistence = new IndexeddbPersistence(`doc-${documentId}`, ydoc)
-    persistenceRef.current = persistence
-
-    persistence.on('synced', () => {
+    const joinRoom = () => {
+      joined = false
+      setSynced(false)
       socket.emit('doc:join', { documentId })
-    })
+    }
 
-    socket.on('doc:joined', ({ documentId: id, yjsState }) => {
+    const handleJoined = ({ documentId: id, yjsState }: { documentId: string; yjsState: ArrayBuffer }) => {
       if (id !== documentId) return
-      const update = new Uint8Array(yjsState as ArrayBuffer)
-      if (update.length > 0) {
-        Y.applyUpdate(ydoc, update, 'remote')
-      }
+      const update = new Uint8Array(yjsState)
+      if (update.length > 0) Y.applyUpdate(ydoc, update, 'remote')
+      joined = true
       setSynced(true)
-    })
+    }
 
-    socket.on('yjs:update', ({ documentId: id, update }) => {
+    const handleYjsUpdate = ({ documentId: id, update }: { documentId: string; update: ArrayBuffer }) => {
       if (id !== documentId) return
-      Y.applyUpdate(ydoc, new Uint8Array(update as ArrayBuffer), 'remote')
-    })
+      Y.applyUpdate(ydoc, new Uint8Array(update), 'remote')
+    }
 
     const handleUpdate = (update: Uint8Array, origin: unknown) => {
-      if (origin === 'remote' || origin === 'load' || origin === 'restore') return
-      socket.emit('yjs:update', { documentId, update: update.buffer as ArrayBuffer })
+      if (origin === 'remote' || !joined) return
+      // slice() ensures we own the buffer even when Y.js returns a view into a larger one.
+      socket.emit('yjs:update', { documentId, update: update.slice().buffer as ArrayBuffer })
     }
 
+    socket.on('doc:joined', handleJoined)
+    socket.on('yjs:update', handleYjsUpdate)
+    socket.on('connect', joinRoom)
     ydoc.on('update', handleUpdate)
 
+    if (socket.connected) joinRoom()
+
     return () => {
+      joined = false
       socket.emit('doc:leave', { documentId })
-      socket.off('doc:joined')
-      socket.off('yjs:update')
+      socket.off('doc:joined', handleJoined)
+      socket.off('yjs:update', handleYjsUpdate)
+      socket.off('connect', joinRoom)
       ydoc.off('update', handleUpdate)
-      ydoc.destroy()
-      persistence.destroy()
-      ydocRef.current = null
-      persistenceRef.current = null
       setSynced(false)
     }
-  }, [documentId, socket])
+  }, [documentId, socket, ydoc])
 
-  return { ydoc: ydocRef.current, synced }
+  return { ydoc, synced }
 }

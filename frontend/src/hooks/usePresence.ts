@@ -4,12 +4,15 @@ import { useEffect } from 'react'
 import { useSocket } from './useSocket'
 import { usePresenceStore } from '@/store/presence.store'
 import { useActivityStore } from '@/store/activity.store'
+import type { PresenceUser } from '@/types'
+
+const EMPTY_USERS: PresenceUser[] = []
 
 export function usePresence(documentId: string) {
   const socket = useSocket()
   const { setUsers, addUser, removeUser } = usePresenceStore()
   const { addEvent } = useActivityStore()
-  const users = usePresenceStore((s) => s.usersByDoc[documentId] ?? [])
+  const users = usePresenceStore((s) => s.usersByDoc[documentId] ?? EMPTY_USERS)
 
   useEffect(() => {
     socket.on('presence:list', ({ documentId: id, users }) => {

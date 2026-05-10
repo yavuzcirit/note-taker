@@ -1,154 +1,236 @@
 # Note Taker — Real-Time Collaborative Editor
 
-A full-stack real-time collaborative note-taking application built with Next.js 15, Node.js/Express, PostgreSQL, and Yjs CRDT.
+A full-stack real-time collaborative note-taking application inspired by Notion, built with Next.js 15, Node.js/Express, PostgreSQL, and Yjs CRDT.
+
+---
+
+## Tech Stack
+
+| Layer | Choice |
+|---|---|
+| Frontend | Next.js 15 (App Router), TypeScript, Tailwind CSS v4 |
+| Rich Text | TipTap v2 + Yjs Collaboration extension |
+| CRDT / Offline | Yjs + y-indexeddb |
+| Server State | TanStack Query v5 |
+| Client State | Zustand v5 |
+| Backend | Node.js + Express, TypeScript |
+| Real-time | Socket.io v4 (custom Yjs transport) |
+| Database | PostgreSQL 16 + Prisma ORM |
+| Auth | JWT — httpOnly cookies, access + refresh tokens |
+| Containers | Docker + Docker Compose |
 
 ---
 
 ## Architecture
 
-### Frontend — Next.js 15 (App Router)
+### Frontend — Next.js 15 App Router
 
-- **Atomic Design** — components organized as `atoms` → `molecules` → `organisms`. Pages are pure Server Components; only interactive leaf components carry `'use client'`.
-- **SSR** — document metadata, initial content, and sidebar data are server-rendered via direct Prisma queries or server-side `fetch` with auth cookies. Zero client-side waterfalls on first load.
-- **TanStack Query v5** — server state (document list, versions, share links) with optimistic updates.
-- **Zustand v5** — client/real-time state: presence users per document, activity feed events, UI panel state.
-- **TipTap v2** — block-based rich text editor. Slash commands (`/heading`, `/code`, `/bullet`, etc.) via a custom TipTap `Extension` + Tippy.js floating menu.
-- **Yjs + y-indexeddb** — CRDT state on the client, persisted to IndexedDB for offline support.
+**Atomic Design** — `atoms` (Button, Input, Avatar, Modal, Badge, Spinner, Icons) → `molecules` (DocumentItem, VersionItem, ToolbarButton, ActivityItem) → `organisms` (Editor, Sidebar, LoginForm, VersionHistory, ShareModal, ActivityFeed). Pages are pure Server Components with no `'use client'`; only interactive organisms carry the directive.
+
+**SSR** — sidebar document list, document metadata (`generateMetadata`), and initial editor content are all fetched server-side with auth cookies. No client-side waterfall on first load.
+
+**Icons** — all SVGs live in a single `components/atoms/icons/index.tsx` and are imported from there across the codebase.
 
 ### Backend — Node.js + Express
 
-- **Service layer** — `routes → controllers → services → Prisma`. No business logic in controllers.
-- **Socket.io v4** on `/collaboration` namespace — handles Yjs binary updates, awareness (cursors/presence), title changes, version creation.
-- **Yjs service** — maintains an in-memory `Map<documentId, Y.Doc>`. On first join it hydrates from PostgreSQL (`documents.yjsState`). On last leave it persists back and frees memory. Debounced DB flush (2s) on each update.
-- **JWT auth** — access token (15 min) + refresh token (7 days). Both stored in `httpOnly; SameSite` cookies. Refresh tokens hashed with SHA-256 before DB storage. Socket handshake verified via the same JWT.
+Layered as `routes → controllers → services → Prisma`. No business logic in controllers.
 
-### Database — PostgreSQL + Prisma
+- **Yjs service** — in-memory `Map<documentId, Y.Doc>`. Hydrates from `documents.yjsState` (Postgres) on first socket join. Debounced DB flush every 2 s on updates. Persists and frees memory when the last user leaves a document room.
+- **Socket.io** on `/collaboration` namespace — Yjs binary sync, awareness (cursors/presence), title broadcasts, version snapshots, activity feed.
+- **JWT** — 15-min access token + 7-day refresh token, both in `httpOnly; SameSite` cookies. Refresh tokens stored as SHA-256 hashes. Socket handshake uses the same access token.
+
+### Database
 
 | Table | Purpose |
 |---|---|
 | `users` | Auth, name, avatar |
-| `documents` | Title, TipTap JSON content (for SSR), Yjs binary state, soft-delete |
-| `versions` | Yjs snapshots + TipTap JSON per version, author, timestamp |
+| `documents` | Title, TipTap JSON (SSR cache), Yjs binary state, soft-delete |
+| `versions` | Full Yjs snapshots + TipTap JSON per version |
 | `share_links` | UUID token, READ/EDIT permission, optional expiry |
-| `refresh_tokens` | SHA-256 hashed tokens, TTL |
+| `refresh_tokens` | SHA-256 hashed, TTL enforced |
 
 ---
 
-## Real-Time Sync — Yjs + Socket.io (CRDT Approach)
+## Real-Time Sync — Yjs + Socket.io
 
-Instead of using `y-websocket` (raw WebSocket), Yjs is wired manually through Socket.io. This enables JWT authentication on every WebSocket connection.
+`y-websocket` was not used because it runs a separate raw WebSocket server with no auth. Instead Yjs is wired directly through Socket.io, giving unified JWT middleware.
 
-**Data flow for an edit:**
-1. User types → TipTap mutation → `Y.Doc` fires `update` event (binary delta)
-2. Client emits `yjs:update` to server with the delta (`ArrayBuffer`)
-3. Server applies `Y.applyUpdate(serverYdoc, delta, 'remote')` — merges into the in-memory doc
+**Edit flow:**
+1. User types → TipTap mutation → `Y.Doc` emits `update` (binary delta)
+2. Client emits `yjs:update` with the delta as `ArrayBuffer`
+3. Server applies `Y.applyUpdate(doc, delta, 'remote')` → merges into the in-memory doc
 4. Server broadcasts the same delta to all other sockets in the room
-5. Peers apply `Y.applyUpdate(clientYdoc, delta, 'remote')` → TipTap re-renders
+5. Peers apply `Y.applyUpdate(clientDoc, delta, 'remote')` → TipTap re-renders
 
-The `origin: 'remote'` flag prevents re-broadcasting received updates (no echo loops).
+The `'remote'` origin tag prevents update listeners from re-emitting received deltas (no echo loops).
 
-**Offline support:** `y-indexeddb` persists the Y.Doc locally. On reconnect, `doc:join` exchanges state vectors and Yjs automatically merges any diverged local edits with the server state — zero manual conflict resolution needed (CRDT guarantee).
+**Offline:** `y-indexeddb` persists the Y.Doc locally. On reconnect, state vectors are exchanged and Yjs merges local + server edits automatically — no manual conflict resolution.
 
-**Awareness (cursors):** `y-protocols/awareness` binary protocol sent over `awareness:update` socket events. `@tiptap/extension-collaboration-cursor` renders remote cursors with per-user colors.
+**Awareness (cursors):** `y-protocols/awareness` binary updates travel over `awareness:update` socket events. `@tiptap/extension-collaboration-cursor` renders per-user colored carets.
 
-### Tradeoffs vs alternatives
+### Conflict resolution tradeoffs
 
 | Approach | Pros | Cons |
 |---|---|---|
-| **Yjs CRDT** (chosen) | Conflict-free, offline support, battle-tested | Binary state harder to inspect/debug |
-| OT (Operational Transform) | Simpler server logic | Hard to implement correctly, no offline |
-| Delta-based (last-write-wins) | Simplest | Loses concurrent edits |
+| **Yjs CRDT** (chosen) | Conflict-free, offline, battle-tested | Binary state harder to inspect |
+| Operational Transform | Simpler server logic | Hard to implement correctly, no offline |
+| Last-write-wins | Simplest | Loses concurrent edits |
 
 ---
 
 ## Setup
 
 ### Prerequisites
-- Docker + Docker Compose
-- Node.js 22+ (for local dev)
 
-### Docker (recommended)
+- Docker + Docker Compose
+- Node.js 22+ (local dev only)
+
+### Docker — one command
 
 ```bash
 cp .env.example backend/.env
-# Edit backend/.env — set strong JWT secrets
+# Set strong values for JWT_ACCESS_SECRET and JWT_REFRESH_SECRET in backend/.env
 
 docker compose up
 ```
 
-App available at `http://localhost:3000`.
+Frontend → `http://localhost:3000` · Backend → `http://localhost:4000`
+
+> Postgres is exposed on **port 5434** (5432 was occupied on the dev machine).
 
 ### Local Development
 
 ```bash
-# 1. Start Postgres
+# Terminal 1 — Postgres
 docker compose up -d postgres
 
-# 2. Backend
+# Terminal 2 — Backend
 cd backend
-cp ../.env.example .env   # edit DATABASE_URL port if needed
+cp ../.env.example .env          # DATABASE_URL uses port 5434 by default
 npm install
 npx prisma migrate dev
-npm run dev
+npm run dev                      # http://localhost:4000
 
-# 3. Frontend
+# Terminal 3 — Frontend
 cd frontend
-npm install --legacy-peer-deps
-npm run dev
+npm install --legacy-peer-deps   # TipTap peer dep resolution
+npm run dev                      # http://localhost:3000
+```
+
+### Debug mode
+
+```bash
+cd backend
+node --inspect -r tsx/cjs src/index.ts
+# Attach VS Code debugger to localhost:9229
 ```
 
 ---
 
 ## Features
 
-### Core
-- ✅ Create, rename, delete (soft delete) documents with sidebar
-- ✅ Restore deleted documents from Trash
-- ✅ Block-based rich text editor: headings H1–H3, paragraph, bullet list, ordered list, code block, blockquote, divider
-- ✅ Slash commands: type `/` anywhere to open command palette
-- ✅ Auto-save (debounced 1.5s) to PostgreSQL
-- ✅ Real-time multi-user collaboration via Yjs + Socket.io
-- ✅ Presence indicators (avatars + per-user colored cursors)
-- ✅ Document version history: manual + auto snapshots every 30 min
-- ✅ Restore to any previous version
-- ✅ JWT authentication with httpOnly cookies + refresh token rotation
-- ✅ User-scoped workspaces (all queries filtered by `ownerId`)
+### Core Requirements
 
-### Bonus
-- ✅ CRDT conflict-free sync (Yjs)
-- ✅ Offline support (y-indexeddb, auto-merge on reconnect)
-- ✅ Document sharing — generate READ or EDIT links with optional expiry
-- ✅ Real-time activity feed per document
+| Feature | Status |
+|---|---|
+| Create / rename / delete documents | ✅ |
+| Sidebar document list | ✅ |
+| Soft delete + restore from Trash | ✅ |
+| Block-based editor — H1–H3, paragraph, bullet, ordered, code block, blockquote, divider | ✅ |
+| Slash commands (`/heading`, `/code`, `/bullet`, …) | ✅ |
+| Auto-save with debounce (1.5 s) | ✅ |
+| Real-time multi-user sync via Yjs + Socket.io | ✅ |
+| Presence indicators — avatars + colored remote cursors | ✅ |
+| Version history — auto (30 min) + manual snapshots | ✅ |
+| Restore to any previous version | ✅ |
+| JWT auth — httpOnly cookies, refresh token rotation | ✅ |
+| User-scoped workspaces | ✅ |
+
+### Bonus Features
+
+| Feature | Status |
+|---|---|
+| Conflict-free CRDT sync (Yjs) | ✅ |
+| Offline support + auto-merge on reconnect | ✅ |
+| Document sharing — READ or EDIT links, optional expiry | ✅ |
+| Real-time activity feed per document | ✅ |
 
 ---
 
-## API
+## API Reference
 
-`POST /api/v1/auth/register` `POST /api/v1/auth/login` `POST /api/v1/auth/refresh` `POST /api/v1/auth/logout` `GET /api/v1/auth/me`
+### Auth — `/api/v1/auth`
 
-`GET|POST /api/v1/documents` `GET|PATCH|DELETE /api/v1/documents/:id` `POST /api/v1/documents/:id/restore` `DELETE /api/v1/documents/:id/permanent`
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/register` | — | Create account, set auth cookies |
+| POST | `/login` | — | Sign in, set auth cookies |
+| POST | `/refresh` | cookie | Rotate refresh token |
+| POST | `/logout` | ✓ | Revoke refresh token, clear cookies |
+| GET | `/me` | ✓ | Current user profile |
 
-`GET|POST /api/v1/documents/:id/versions` `POST /api/v1/documents/:id/versions/:vid/restore`
+### Documents — `/api/v1/documents`
 
-`GET|POST|DELETE /api/v1/documents/:id/share` `GET /api/v1/share/:token`
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/` | ✓ | List all non-deleted documents |
+| POST | `/` | ✓ | Create document |
+| GET | `/trash` | ✓ | List soft-deleted documents |
+| GET | `/:id` | ✓ | Get document with content |
+| PATCH | `/:id` | ✓ | Update title / icon / content |
+| DELETE | `/:id` | ✓ | Soft delete |
+| POST | `/:id/restore` | ✓ | Restore from trash |
+| DELETE | `/:id/permanent` | ✓ | Hard delete |
+
+### Versions — `/api/v1/documents/:id/versions`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/` | ✓ | List version history |
+| GET | `/:vid` | ✓ | Get version content |
+| POST | `/:vid/restore` | ✓ | Restore to this version |
+
+### Sharing — `/api/v1/documents/:id/share`
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| POST | `/` | ✓ | Create share link |
+| GET | `/` | ✓ | List share links |
+| DELETE | `/:lid` | ✓ | Revoke share link |
+| GET | `/api/v1/share/:token` | — | Resolve public token |
+
+### Socket.io — `/collaboration`
+
+| Direction | Event | Payload |
+|---|---|---|
+| C → S | `doc:join` | `{ documentId }` |
+| C → S | `doc:leave` | `{ documentId }` |
+| C → S | `yjs:update` | `{ documentId, update: ArrayBuffer }` |
+| C → S | `awareness:update` | `{ documentId, awarenessUpdate: ArrayBuffer }` |
+| C → S | `doc:title-update` | `{ documentId, title }` |
+| C → S | `version:create` | `{ documentId }` |
+| S → C | `doc:joined` | `{ documentId, yjsState, awareness }` |
+| S → C | `yjs:update` | `{ documentId, update }` — broadcast to room |
+| S → C | `presence:list/joined/left` | user info |
+| S → C | `activity:event` | `{ documentId, event }` |
+| S → C | `version:created` | `{ documentId, version }` |
 
 ---
 
 ## AI Tool Usage
 
-**Tool used:** Claude Code (claude-sonnet-4-6) via the VSCode extension.
+**Tool:** Claude Code (claude-sonnet-4-6) via the VS Code extension.
 
-**Where it helped:**
-- Scaffolding boilerplate (package.json, tsconfig, Prisma schema, Express middleware) quickly and correctly
-- Generating the Yjs ↔ Socket.io integration pattern — the `origin` flag trick to prevent echo loops is subtle and the model produced it correctly first try
-- TypeScript type plumbing for Socket.io generic parameters (complex nested generics)
+**Where it was useful:**
+- Yjs ↔ Socket.io transport wiring — the `origin` flag pattern to prevent echo loops is non-obvious and was produced correctly on the first attempt
+- TypeScript generic plumbing for Socket.io typed namespaces
+- Scaffolding repetitive boilerplate (Prisma schema, Express middleware, Zustand stores)
 
-**Where it fell short / required correction:**
-- Initially put `'use client'` at page level — corrected to enforce Server Component pages with `'use client'` only on organism-level components
-- Used `history: false` in StarterKit which is the old TipTap API — the new v2 uses `undoRedo: false`, caught and fixed after type check
-- Generated components without atomic design separation — restructured into `atoms / molecules / organisms` hierarchy after feedback
-- SVG icons were inlined inline everywhere — consolidated into a single `atoms/icons/index.tsx` export file
+**Where it required correction:**
+- Added `'use client'` at page level — enforced Server Component pages; `'use client'` moved to organism components only
+- Used `StarterKit.configure({ history: false })` — TipTap v2 renamed this to `undoRedo: false`; caught by the type checker
+- Scattered SVG literals across components — consolidated into `atoms/icons/index.tsx`
+- Generated flat component structure — restructured into Atomic Design (`atoms / molecules / organisms`)
 
 **Decisions overridden:**
-- The model suggested `y-websocket` as a separate server; chose to embed Yjs into Socket.io handlers instead for unified auth middleware
-- Suggested `history` option for StarterKit — corrected to `undoRedo` after inspecting TipTap v2 type definitions
+- Suggested a standalone `y-websocket` server; replaced with a custom Socket.io transport so the same JWT middleware covers both HTTP and WebSocket

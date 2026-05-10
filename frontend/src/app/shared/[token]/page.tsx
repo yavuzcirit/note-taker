@@ -1,4 +1,5 @@
-import { notFound } from 'next/navigation'
+import { notFound, redirect } from 'next/navigation'
+import { cookies } from 'next/headers'
 import { Metadata } from 'next'
 import { SharedDocumentClient } from './SharedDocumentClient'
 
@@ -31,6 +32,14 @@ export default async function SharedDocumentPage({ params }: PageProps) {
 
   const data = await res.json()
 
+  // Authenticated users with edit permission get the full collaborative workspace editor.
+  if (data.permission === 'EDIT') {
+    const cookieStore = await cookies()
+    if (cookieStore.has('access_token')) {
+      redirect(`/workspace/document/${data.document.id}`)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-white dark:bg-gray-900">
       <header className="border-b border-gray-200 px-6 py-4 dark:border-gray-700">
@@ -43,7 +52,7 @@ export default async function SharedDocumentPage({ params }: PageProps) {
           </span>
         </div>
       </header>
-      <SharedDocumentClient document={data.document} permission={data.permission} />
+      <SharedDocumentClient token={token} document={data.document} permission={data.permission} />
     </div>
   )
 }
